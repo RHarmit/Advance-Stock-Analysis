@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from requests.exceptions import HTTPError, ConnectionError
 
 # ————— Configuration —————
-API_KEY           = '03T_q_VPvhDKyvZUl5WBrLn3qAaWcJqV'
+API_KEY           = ''
 MARKET_OPEN       = "08:30"
 MARKET_CLOSE      = "15:00"
 MAX_CALLS_PER_MIN = 5    # calls per 60s window
