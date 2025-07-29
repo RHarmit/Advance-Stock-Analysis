@@ -1,86 +1,159 @@
+"""
+Fetch minute‐level equity returns with a client‐side rate‐limit window,
+identify the top‐3 spike intervals (with counts), pick the best interval & day,
+"""
+
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import yfinance as yf
-import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from polygon import RESTClient
+import plotly.express as px
+import plotly.graph_objects as go
+from requests.exceptions import HTTPError, ConnectionError
 
-# Prompting user to enter the ticker symbol
-ticker_symbol = input("Please enter the ticker symbol: ")
+# ————— Configuration —————
+API_KEY           = '03T_q_VPvhDKyvZUl5WBrLn3qAaWcJqV'
+MARKET_OPEN       = "08:30"
+MARKET_CLOSE      = "15:00"
+MAX_CALLS_PER_MIN = 5    # calls per 60s window
+# ——————————————————————————
 
-# Calculate the end date as December 31 of the previous year
-today = datetime.today()
-last_day_of_previous_year = today.replace(year=today.year - 1, month=12, day=31)
-end_date = last_day_of_previous_year.strftime('%Y-%m-%d')
+client = RESTClient(API_KEY)
 
-# Specify the directory path
-output_dir = r'C:\Users\HR\OneDrive\Desktop\Spring 24\Schaffer\'s investment\pic'
-print(f"Saving images to: {output_dir}")
+def fetch_data(ticker, start, end, duration):
+    rows, calls, window_start = [], 0, time.time()
+    current = start
 
-# Create the directory if it does not exist
-if not os.path.exists(output_dir):
-    os.makedirs(output_dir)
+    while current < end:
+        if calls >= MAX_CALLS_PER_MIN:
+            elapsed = time.time() - window_start
+            wait = max(0, 60 - int(elapsed))
+            for s in range(wait, 0, -1):
+                print(f"\rWindow resets in {s:2d}s…", end="", flush=True)
+                time.sleep(1)
+            calls = 0
+            window_start = time.time()
+            print("\rWindow reset; resuming…     ")
 
-# Download stock data for the entered ticker symbol
-stock_data = yf.download(ticker_symbol, start='2010-01-01', end=end_date)
+        block_end = min(current + timedelta(days=59), end)
+        frm, to = current.strftime("%Y-%m-%d"), block_end.strftime("%Y-%m-%d")
+        print(f"\nFetching {ticker}: {frm} → {to}  (call {calls+1})")
 
-# Create a column for the month and year
-stock_data['Month'] = stock_data.index.month
-stock_data['Year'] = stock_data.index.year
+        while True:
+            try:
+                aggs = client.get_aggs(ticker, duration, "minute", frm, to)
+                break
+            except HTTPError as e:
+                if e.response.status_code == 429:
+                    for s in range(60, 0, -1):
+                        print(f"\r429 – retry in {s:2d}s…", end="", flush=True)
+                        time.sleep(1)
+                    calls = 0
+                    window_start = time.time()
+                    continue
+                raise
+            except ConnectionError:
+                print("\nNetwork error; waiting 10s…")
+                time.sleep(10)
+                continue
 
-# Calculate monthly returns
-stock_data['Monthly Return'] = stock_data['Adj Close'].pct_change().groupby([stock_data['Year'], stock_data['Month']]).transform('sum')
+        for bar in aggs:
+            rows.append([bar.timestamp, bar.close])
 
-# Remove incomplete months from the current year
-complete_months = stock_data.groupby(['Year', 'Month']).size().unstack(fill_value=0)
-last_year = last_day_of_previous_year.year
-months_in_last_year = complete_months.loc[last_year]
-months_to_exclude = months_in_last_year[months_in_last_year == 0].index
-stock_data = stock_data[~((stock_data['Year'] == last_year) & (stock_data['Month'].isin(months_to_exclude)))]
+        calls += 1
+        current = block_end + timedelta(days=1)
 
-# Pivot table to create the heatmap data
-heatmap_data = stock_data.pivot_table(values='Monthly Return', index='Year', columns='Month', aggfunc=np.mean)
+    df = pd.DataFrame(rows, columns=["timestamp","close"])
+    df["timestamp"] = (
+        pd.to_datetime(df["timestamp"], unit="ms")
+          .dt.tz_localize("UTC")
+          .dt.tz_convert("America/Chicago")
+    )
+    df.set_index("timestamp", inplace=True)
+    return df
 
-# Plotting the heatmap
-plt.figure(figsize=(14, 8))
-sns.heatmap(heatmap_data, cmap='RdYlGn', center=0, annot=True, fmt=".2%")
-plt.title(f'Seasonality Heatmap for {ticker_symbol} Stock')
-plt.xlabel('Month')
-plt.ylabel('Year')
-plt.xticks(ticks=np.arange(12) + 0.5, labels=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])
-plt.yticks(rotation=0)
-plt.show()
+def compute_top(df, duration):
+    df = df.between_time(MARKET_OPEN, MARKET_CLOSE).copy()
+    df["ret"]  = df["close"].pct_change().fillna(0)
+    df["time"] = df.index.strftime("%H:%M")
 
-# Calculating average monthly return and probability of positive returns
-monthly_avg_return = heatmap_data.mean()
-positive_return_prob = (heatmap_data > 0).mean()
+    spikes = df[df["ret"].abs() >= 0.002]
+    times  = spikes.index.time
+    counts = spikes.groupby(times)["ret"].count()
+    avgs   = spikes.groupby(times)["ret"].mean() * 100
+    sds    = spikes.groupby(times)["ret"].std()  * 100
 
-# Combining the results into a DataFrame for better visualization
-analysis_df = pd.DataFrame({
-    'Average Return': monthly_avg_return,
-    'Probability of Positive Return': positive_return_prob
-})
-print(analysis_df)
+    top3    = avgs.nlargest(3)
+    best_t  = top3.idxmax()
+    best    = {
+        "start": best_t.strftime("%H:%M"),
+        "end":   (datetime.combine(datetime.today(), best_t)
+                  + timedelta(minutes=duration)).time().strftime("%H:%M"),
+        "mean":  avgs[best_t],
+        "sd":    sds[best_t]
+    }
 
-# Sorting and plotting the probability and average monthly returns
-for metric, title, color in zip(
-    ['Probability of Positive Return', 'Average Return'],
-    ['Probability of Positive Returns by Month', 'Average Monthly Returns by Month'],
-    ['skyblue', 'lightgreen']
-):
-    sorted_data = analysis_df[metric].sort_values()
-    plt.figure(figsize=(10, 6))
-    bars = sorted_data.plot(kind='bar', color=color)
-    plt.title(f'{title} for {ticker_symbol} Stock')
-    plt.xlabel('Month')
-    plt.ylabel(metric)
-    plt.xticks(ticks=np.arange(12), labels=sorted_data.index.map({1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun', 7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'}), rotation=45)
-    plt.grid(axis='y')
+    df["day"] = df.index.day_name()
+    heat = (
+        df.pivot_table("ret", index="day", columns="time", aggfunc="sum")
+          .reindex(["Monday","Tuesday","Wednesday","Thursday","Friday"])
+    )
+    best_day = heat[best["start"]].idxmax()
 
-    # Adding percentage labels on the bars
-    for bar in bars.patches:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height, f'{height:.2%}', ha='center', va='bottom')
+    return heat, top3, counts, best, best_day
 
-    plt.show()
+
+def plot_heatmap(heat, best):
+    col = best["start"]
+    z   = heat[[col]].values.tolist()
+    x   = [col]
+    y   = heat.index.tolist()
+    fig = px.imshow(z, x=x, y=y,
+                    labels={"x":"Start (CST)","y":"Day","color":"Return (%)"},
+                    color_continuous_scale="RdYlGn", aspect="auto")
+    fig.update_traces(hovertemplate="Day: %{y}<br>Return: %{z:.3f}%")
+    fig.update_layout(title=f"{best['start']}–{best['end']} Agg Returns",
+                      margin=dict(l=80, r=20, t=60, b=40))
+    fig.show()
+
+def plot_bar(best):
+    fig = go.Figure(go.Bar(
+        x=[best["start"]],
+        y=[best["mean"]],
+        error_y=dict(array=[best["sd"]], type="data")
+    ))
+    fig.update_layout(title=f"Return ±SD @ {best['start']}",
+                      xaxis_title="Start (CST)",
+                      yaxis_title="Return (%)",
+                      margin=dict(l=60, r=20, t=60, b=40))
+    fig.show()
+
+def main():
+    ticker    = input("Ticker symbol: ").upper().strip()
+    qty, unit = input("Historical period (e.g. '2 years'): ").split()
+    iq, iu    = input("Aggregation (e.g. '5 minutes'): ").split()
+    qty, iq   = int(qty), int(iq)
+    duration  = iq*60 if "hour" in iu.lower() else iq
+
+    today = datetime.today()
+    if "year" in unit:    start = today - timedelta(days=365*qty)
+    elif "month" in unit: start = today - timedelta(days=30*qty)
+    else:                  start = today - timedelta(days=qty)
+
+    df = fetch_data(ticker, start, today, duration)
+    heat, top3, counts, best, best_day = compute_top(df, duration)
+
+    print("\nTop 3 intervals by avg return (with spike counts):")
+    for t, avg in top3.items():
+        end_t = (datetime.combine(datetime.today(), t)
+                 + timedelta(minutes=duration)).time().strftime("%H:%M")
+        print(f" {t.strftime('%H:%M')}-{end_t} → {avg:.2f}% over {counts[t]} spikes")
+
+    print(f"\nBest: {best_day} {best['start']}-{best['end']}  Mean={best['mean']:.2f}%, SD={best['sd']:.2f}%\n")
+
+    plot_heatmap(heat, best)
+    plot_bar(best)
+
+   
+if __name__ == "__main__":
+    main()
